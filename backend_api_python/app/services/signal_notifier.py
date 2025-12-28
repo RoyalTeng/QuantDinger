@@ -18,6 +18,8 @@ notification_config = {
 from __future__ import annotations
 
 import html
+import hmac
+import hashlib
 import json
 import os
 import smtplib
@@ -186,6 +188,13 @@ class SignalNotifier:
                     ok, err = self._notify_webhook(
                         url=url,
                         payload=payload,
+                        headers_override=(targets.get("webhook_headers") or targets.get("webhookHeaders") or None),
+                        token_override=(targets.get("webhook_token") or targets.get("webhookToken") or None),
+                        signing_secret_override=(
+                            targets.get("webhook_signing_secret")
+                            or targets.get("webhookSigningSecret")
+                            or None
+                        ),
                     )
                 elif c == "discord":
                     url = (targets.get("discord") or "").strip()
@@ -228,6 +237,11 @@ class SignalNotifier:
                 ok, err = False, str(e)
 
             results[c] = {"ok": bool(ok), "error": (err or "")}
+            if not ok and c in ("webhook", "discord"):
+                # Keep logs high-signal and avoid leaking full URLs (webhook URLs contain secrets).
+                logger.info(
+                    f"notify failed: channel={c} strategy_id={strategy_id} symbol={symbol} signal={signal_type} err={err}"
+                )
 
         return results
 
@@ -462,16 +476,93 @@ class SignalNotifier:
             logger.warning(f"browser notify persist failed: {e}")
             return False, str(e)
 
-    def _notify_webhook(self, *, url: str, payload: Dict[str, Any]) -> Tuple[bool, str]:
+    def _notify_webhook(
+        self,
+        *,
+        url: str,
+        payload: Dict[str, Any],
+        headers_override: Any = None,
+        token_override: Any = None,
+        signing_secret_override: Any = None,
+    ) -> Tuple[bool, str]:
+        """
+        Generic webhook delivery.
+
+        Supports (best-effort):
+        - per-strategy headers: notification_config.targets.webhook_headers (dict or JSON string)
+        - per-strategy bearer token: notification_config.targets.webhook_token
+        - global bearer token: SIGNAL_WEBHOOK_TOKEN
+        - optional signing secret: notification_config.targets.webhook_signing_secret or env SIGNAL_WEBHOOK_SIGNING_SECRET
+          Adds headers:
+            - X-QD-Timestamp: unix seconds
+            - X-QD-Signature: hex(HMAC_SHA256("{ts}.{body}", secret))
+        - retry once on 429/5xx
+        """
         if not url:
             return False, "missing_webhook_url"
-        headers = {"Content-Type": "application/json"}
-        if self.webhook_token:
-            headers["Authorization"] = f"Bearer {self.webhook_token}"
+        if not (str(url).startswith("http://") or str(url).startswith("https://")):
+            return False, "invalid_webhook_url"
+
+        headers: Dict[str, str] = {
+            "Content-Type": "application/json",
+            "User-Agent": "QuantDinger/1.0 (+https://www.quantdinger.com)",
+        }
+
+        # Per-strategy header overrides (optional)
+        wh = headers_override
+        if isinstance(wh, str) and wh.strip():
+            try:
+                obj = json.loads(wh)
+                wh = obj if isinstance(obj, dict) else None
+            except Exception:
+                wh = None
+        if isinstance(wh, dict):
+            for k, v in wh.items():
+                kk = str(k or "").strip()
+                if not kk:
+                    continue
+                headers[kk] = str(v if v is not None else "")
+
+        # Auth (per-strategy token first, fallback to global token)
+        tok = str(token_override or "").strip()
+        if not tok:
+            tok = self.webhook_token
+        if tok and "Authorization" not in headers:
+            headers["Authorization"] = f"Bearer {tok}"
+
+        # Optional signing secret (per-strategy override, else env)
+        signing_secret = str(signing_secret_override or "").strip() or (os.getenv("SIGNAL_WEBHOOK_SIGNING_SECRET") or "").strip()
+        if signing_secret:
+            try:
+                ts = str(int(time.time()))
+                body = json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                sig_base = (ts + ".").encode("utf-8") + body
+                sig = hmac.new(signing_secret.encode("utf-8"), sig_base, hashlib.sha256).hexdigest()
+                headers["X-QD-Timestamp"] = ts
+                headers["X-QD-Signature"] = sig
+                # Send raw bytes so signature matches what we sign.
+                def _post_once(timeout: float) -> requests.Response:
+                    return requests.post(url, data=body, headers=headers, timeout=timeout)
+            except Exception as e:
+                return False, f"webhook_signing_failed:{e}"
+        else:
+            def _post_once(timeout: float) -> requests.Response:
+                return requests.post(url, json=payload, headers=headers, timeout=timeout)
+
+        # Post with minimal retry on 429/5xx
         try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=self.timeout_sec)
+            resp = _post_once(self.timeout_sec)
             if 200 <= resp.status_code < 300:
                 return True, ""
+            if resp.status_code in (429, 500, 502, 503, 504):
+                try:
+                    time.sleep(1.0)
+                except Exception:
+                    pass
+                resp2 = _post_once(self.timeout_sec)
+                if 200 <= resp2.status_code < 300:
+                    return True, ""
+                return False, f"http_{resp2.status_code}:{(resp2.text or '')[:300]}"
             return False, f"http_{resp.status_code}:{(resp.text or '')[:300]}"
         except Exception as e:
             return False, str(e)
@@ -479,6 +570,8 @@ class SignalNotifier:
     def _notify_discord(self, *, url: str, payload: Dict[str, Any], fallback_text: str) -> Tuple[bool, str]:
         if not url:
             return False, "missing_discord_webhook_url"
+        if not (str(url).startswith("http://") or str(url).startswith("https://")):
+            return False, "invalid_discord_webhook_url"
 
         strategy = (payload or {}).get("strategy") or {}
         instrument = (payload or {}).get("instrument") or {}
@@ -508,15 +601,41 @@ class SignalNotifier:
             embed["timestamp"] = str(payload.get("timestamp_iso") or "")
         if trace.get("pending_order_id"):
             embed["footer"] = {"text": f"pending_order_id={int(trace.get('pending_order_id'))}"}
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "QuantDinger/1.0 (+https://www.quantdinger.com)",
+        }
+
+        def _post(payload_json: Dict[str, Any]) -> requests.Response:
+            return requests.post(url, json=payload_json, headers=headers, timeout=self.timeout_sec)
+
         try:
-            resp = requests.post(url, json={"content": "", "embeds": [embed]}, timeout=self.timeout_sec)
+            resp = _post({"content": "", "embeds": [embed]})
             if 200 <= resp.status_code < 300:
                 return True, ""
-            # Fallback: try plain text.
+
+            # Rate limit: retry once if Discord asks us to.
+            if resp.status_code == 429:
+                try:
+                    data = resp.json() if resp is not None else {}
+                    retry_after = float((data or {}).get("retry_after") or 1.0)
+                    time.sleep(min(max(retry_after, 0.5), 3.0))
+                except Exception:
+                    try:
+                        time.sleep(1.0)
+                    except Exception:
+                        pass
+                resp_retry = _post({"content": "", "embeds": [embed]})
+                if 200 <= resp_retry.status_code < 300:
+                    return True, ""
+                resp = resp_retry
+
+            # Fallback: plain text (some servers reject embeds)
             try:
-                resp2 = requests.post(url, json={"content": str(fallback_text or "")[:1900]}, timeout=self.timeout_sec)
+                resp2 = _post({"content": str(fallback_text or "")[:1900]})
                 if 200 <= resp2.status_code < 300:
                     return True, ""
+                # If fallback also fails, return the original error (more useful than fallback sometimes).
             except Exception:
                 pass
             return False, f"http_{resp.status_code}:{(resp.text or '')[:300]}"

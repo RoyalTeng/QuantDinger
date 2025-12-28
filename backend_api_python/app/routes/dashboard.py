@@ -107,7 +107,7 @@ def summary():
             cur = db.cursor()
             cur.execute(
                 """
-                SELECT id, strategy_name, strategy_type, status, initial_capital
+                SELECT id, strategy_name, strategy_type, status, initial_capital, trading_config
                 FROM qd_strategies_trading
                 """
             )
@@ -116,7 +116,23 @@ def summary():
 
         running = [s for s in strategies if (s.get("status") or "").strip().lower() == "running"]
         indicator_strategy_count = len([s for s in running if (s.get("strategy_type") or "") == "IndicatorStrategy"])
-        ai_strategy_count = max(0, len(running) - indicator_strategy_count)
+
+        # "AI strategies" in dashboard card: count strategies that enabled AI analysis/filtering.
+        # This aligns with the UI toggle `enable_ai_filter` in trading_config.
+        def _truthy(v: Any) -> bool:
+            if v is True:
+                return True
+            if isinstance(v, (int, float)) and float(v) == 1:
+                return True
+            if isinstance(v, str) and v.strip().lower() in ("1", "true", "yes", "y", "on"):
+                return True
+            return False
+
+        ai_enabled_strategy_count = 0
+        for s in strategies:
+            tc = _safe_json_loads(s.get("trading_config"), {}) or {}
+            if isinstance(tc, dict) and _truthy(tc.get("enable_ai_filter")):
+                ai_enabled_strategy_count += 1
 
         # Positions (best-effort)
         with get_db_connection() as db:
@@ -212,7 +228,7 @@ def summary():
                 "code": 1,
                 "msg": "success",
                 "data": {
-                    "ai_strategy_count": int(ai_strategy_count),
+                    "ai_strategy_count": int(ai_enabled_strategy_count),
                     "indicator_strategy_count": int(indicator_strategy_count),
                     "total_equity": float(total_equity),
                     "total_pnl": float(total_pnl),

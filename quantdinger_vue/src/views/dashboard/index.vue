@@ -41,7 +41,7 @@
 
       <!-- 运行中 AI 策略 -->
       <a-col :xs="12" :sm="12" :md="6">
-        <div class="dashboard-card info-card clickable-card" @click="$router.push('/ai-trading-assistant')">
+        <div class="dashboard-card info-card">
           <div class="card-icon">
             <a-icon type="thunderbolt" theme="filled" />
           </div>
@@ -49,7 +49,7 @@
             <div class="card-label">{{ $t('dashboard.aiStrategies') }}</div>
             <div class="card-value">
               <span class="number">{{ summary.ai_strategy_count }}</span>
-              <span class="unit">{{ $t('dashboard.running') }}</span>
+              <span class="unit">{{ $t('dashboard.enabled') }}</span>
             </div>
           </div>
         </div>
@@ -229,29 +229,12 @@
               </div>
               <div v-else style="color: #999;">-</div>
             </template>
-            <template slot="created_at" slot-scope="text">
-              {{ formatTime(text) }}
-            </template>
-            <template slot="executed_at" slot-scope="text">
-              <span v-if="text">{{ formatTime(text) }}</span>
-              <span v-else style="color: #999;">-</span>
-            </template>
-            <template slot="actions" slot-scope="text, record">
-              <a-popconfirm
-                :title="$t('dashboard.orderTable.deleteConfirm')"
-                :okText="$t('dashboard.orderTable.delete')"
-                :cancelText="$t('cancel')"
-                @confirm="handleDeletePendingOrder(record)"
-              >
-                <a-button
-                  type="link"
-                  size="small"
-                  :disabled="record && String(record.status).toLowerCase() === 'processing'"
-                >
-                  <a-icon type="delete" />
-                  {{ $t('dashboard.orderTable.delete') }}
-                </a-button>
-              </a-popconfirm>
+            <template slot="time_info" slot-scope="text, record">
+              <div>{{ formatTime(record.created_at) }}</div>
+              <div v-if="record.executed_at" style="font-size: 12px; color: #999;">
+                {{ formatTime(record.executed_at) }}
+              </div>
+              <div v-else style="font-size: 12px; color: #999;">-</div>
             </template>
           </a-table>
         </a-card>
@@ -373,12 +356,6 @@ export default {
     orderColumns () {
       return [
         {
-          title: this.$t('dashboard.orderTable.time'),
-          dataIndex: 'created_at',
-          scopedSlots: { customRender: 'created_at' },
-          width: 160
-        },
-        {
           title: this.$t('dashboard.orderTable.strategy'),
           dataIndex: 'strategy_name',
           scopedSlots: { customRender: 'strategy_name' },
@@ -430,17 +407,10 @@ export default {
           width: 150
         },
         {
-          title: this.$t('dashboard.orderTable.executedAt'),
-          dataIndex: 'executed_at',
-          scopedSlots: { customRender: 'executed_at' },
-          width: 160
-        },
-        {
-          title: this.$t('dashboard.orderTable.actions'),
-          key: 'actions',
-          scopedSlots: { customRender: 'actions' },
-          width: 110,
-          fixed: 'right'
+          title: this.$t('dashboard.orderTable.timeInfo'),
+          dataIndex: 'created_at',
+          scopedSlots: { customRender: 'time_info' },
+          width: 180
         }
       ]
     }

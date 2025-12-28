@@ -25,7 +25,17 @@ from app.services.live_trading.binance_spot import BinanceSpotClient
 from app.services.live_trading.okx import OkxClient
 from app.services.live_trading.bitget import BitgetMixClient
 from app.services.live_trading.bitget_spot import BitgetSpotClient
+from app.services.live_trading.bybit import BybitClient
+from app.services.live_trading.coinbase_exchange import CoinbaseExchangeClient
+from app.services.live_trading.kraken import KrakenClient
+from app.services.live_trading.kraken_futures import KrakenFuturesClient
+from app.services.live_trading.kucoin import KucoinSpotClient
+from app.services.live_trading.kucoin import KucoinFuturesClient
+from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient
+from app.services.live_trading.bitfinex import BitfinexClient
+from app.services.live_trading.bitfinex import BitfinexDerivativesClient
 from app.services.live_trading.symbols import to_okx_swap_inst_id
+from app.services.live_trading.symbols import to_gate_currency_pair
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
 
@@ -224,6 +234,116 @@ class PendingOrderWorker:
                                 hb_sym = f"{hb_sym[:-4]}/USDT"
                             side = "long" if hold_side == "long" else "short"
                             exch_size.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = abs(float(total))
+
+                elif isinstance(client, BybitClient) and market_type == "swap":
+                    # Bybit linear positions
+                    resp = client.get_positions()
+                    lst = (((resp.get("result") or {}).get("list")) if isinstance(resp, dict) else None) or []
+                    if isinstance(lst, list):
+                        for p in lst:
+                            if not isinstance(p, dict):
+                                continue
+                            sym = str(p.get("symbol") or "").strip().upper()
+                            side0 = str(p.get("side") or "").strip().lower()  # Buy/Sell
+                            try:
+                                sz = float(p.get("size") or 0.0)
+                            except Exception:
+                                sz = 0.0
+                            if not sym or abs(sz) <= 0:
+                                continue
+                            hb_sym = sym
+                            if hb_sym.endswith("USDT") and len(hb_sym) > 4 and "/" not in hb_sym:
+                                hb_sym = f"{hb_sym[:-4]}/USDT"
+                            side = "long" if side0 == "buy" else ("short" if side0 == "sell" else ("long" if sz > 0 else "short"))
+                            exch_size.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = abs(float(sz))
+
+                elif isinstance(client, GateUsdtFuturesClient) and market_type == "swap":
+                    resp = client.get_positions()
+                    items = resp if isinstance(resp, list) else []
+                    if isinstance(items, list):
+                        for p in items:
+                            if not isinstance(p, dict):
+                                continue
+                            contract = str(p.get("contract") or "").strip()
+                            try:
+                                sz_ct = float(p.get("size") or 0.0)  # contracts, signed
+                            except Exception:
+                                sz_ct = 0.0
+                            if not contract or abs(sz_ct) <= 0:
+                                continue
+                            hb_sym = contract.replace("_", "/")
+                            side = "long" if sz_ct > 0 else "short"
+                            # Convert contracts -> base using quanto_multiplier.
+                            qty_base = abs(sz_ct)
+                            try:
+                                meta = client.get_contract(contract=contract) or {}
+                                qm = float(meta.get("quanto_multiplier") or meta.get("contract_size") or 0.0)
+                                if qm > 0:
+                                    qty_base = qty_base * qm
+                            except Exception:
+                                pass
+                            exch_size.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = float(qty_base)
+
+                elif isinstance(client, KucoinFuturesClient) and market_type == "swap":
+                    resp = client.get_positions()
+                    data = (resp.get("data") if isinstance(resp, dict) else None) or []
+                    if isinstance(data, list):
+                        for p in data:
+                            if not isinstance(p, dict):
+                                continue
+                            sym = str(p.get("symbol") or "").strip()
+                            try:
+                                qty_ct = float(p.get("currentQty") or p.get("quantity") or 0.0)
+                            except Exception:
+                                qty_ct = 0.0
+                            if not sym or abs(qty_ct) <= 0:
+                                continue
+                            side = "long" if qty_ct > 0 else "short"
+                            # Convert contracts -> base using multiplier.
+                            qty_base = abs(qty_ct)
+                            try:
+                                meta = client.get_contract(symbol=sym) or {}
+                                mult = float(meta.get("multiplier") or meta.get("lotSize") or 0.0)
+                                if mult > 0:
+                                    qty_base = qty_base * mult
+                            except Exception:
+                                pass
+                            exch_size.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = float(qty_base)
+
+                elif isinstance(client, KrakenFuturesClient) and market_type == "swap":
+                    resp = client.get_open_positions()
+                    positions = (resp.get("openPositions") if isinstance(resp, dict) else None) or (resp.get("open_positions") if isinstance(resp, dict) else None) or []
+                    if isinstance(positions, list):
+                        for p in positions:
+                            if not isinstance(p, dict):
+                                continue
+                            sym = str(p.get("symbol") or p.get("instrument") or "").strip()
+                            try:
+                                sz = float(p.get("size") or p.get("positionSize") or 0.0)
+                            except Exception:
+                                sz = 0.0
+                            if not sym or abs(sz) <= 0:
+                                continue
+                            side = "long" if sz > 0 else "short"
+                            exch_size.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = abs(float(sz))
+
+                elif isinstance(client, BitfinexDerivativesClient) and market_type == "swap":
+                    resp = client.get_positions()
+                    items = resp if isinstance(resp, list) else []
+                    if isinstance(items, list):
+                        for p in items:
+                            # Bitfinex positions are arrays; best-effort parse:
+                            # [symbol, status, amount, base_price, ...]
+                            try:
+                                if isinstance(p, list) and len(p) >= 3:
+                                    sym = str(p[0] or "")
+                                    amt = float(p[2] or 0.0)
+                                    if not sym or abs(amt) <= 0:
+                                        continue
+                                    side = "long" if amt > 0 else "short"
+                                    exch_size.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = abs(float(amt))
+                            except Exception:
+                                continue
 
                 else:
                     # Spot reconciliation is optional; skip for now (keeps self-check low-risk).
@@ -642,12 +762,38 @@ class PendingOrderWorker:
         if leverage <= 0:
             leverage = 1.0
 
+        # Collect raw exchange interactions / intermediate states for debugging & persistence.
+        phases: Dict[str, Any] = {}
+
+        # Ensure ref price exists (used by maker pricing, fallbacks, and local DB snapshots).
+        if ref_price <= 0:
+            try:
+                if isinstance(client, BinanceFuturesClient):
+                    ref_price = float(client.get_mark_price(symbol=str(symbol)) or 0.0)
+            except Exception:
+                pass
+
+        # Binance Futures leverage is per-symbol on the exchange side.
+        # If we do not set it, Binance may keep default 1x and the user will observe
+        # margin ~= notional (i.e., "margin = invested * leverage" when we sized using leverage).
+        if isinstance(client, BinanceFuturesClient) and market_type == "swap":
+            try:
+                client.set_leverage(symbol=str(symbol), leverage=float(leverage or 1.0))
+                phases["set_leverage"] = {"exchange": "binance", "symbol": str(symbol), "leverage": float(leverage or 1.0)}
+            except Exception as e:
+                # Safer default: do NOT place orders with an unintended leverage.
+                err = f"binance_set_leverage_failed:{e}"
+                logger.warning(f"live leverage set failed: pending_id={order_id}, strategy_id={strategy_id}, cfg={safe_cfg}, err={e}")
+                self._mark_failed(order_id=order_id, error=err)
+                _console_print(f"[worker] order rejected: strategy_id={strategy_id} pending_id={order_id} {err}")
+                _notify_live_best_effort(status="failed", error=err, amount_hint=amount, price_hint=ref_price)
+                return
+
         # Accumulate fills across phases
         total_base = 0.0
         total_quote = 0.0
         total_fee = 0.0
         fee_ccy = ""
-        phases: Dict[str, Any] = {}
 
         def _apply_fill(filled_qty: float, avg_px: float) -> None:
             nonlocal total_base, total_quote
@@ -667,6 +813,23 @@ class PendingOrderWorker:
                 total_fee += fv
                 if (not fee_ccy) and ccy:
                     fee_ccy = str(ccy or "")
+
+        def _fetch_fee_best_effort(*, order_id0: str, client_order_id0: str) -> Tuple[float, str]:
+            """
+            Some exchanges (notably Binance) do not expose commissions on order endpoints.
+            We fetch fills and sum commissions best-effort.
+            """
+            oid = str(order_id0 or "").strip()
+            if not oid:
+                return 0.0, ""
+            try:
+                if isinstance(client, BinanceFuturesClient):
+                    return client.get_fee_for_order(symbol=str(symbol), order_id=oid)
+                if isinstance(client, BinanceSpotClient):
+                    return client.get_fee_for_order(symbol=str(symbol), order_id=oid)
+            except Exception:
+                return 0.0, ""
+            return 0.0, ""
 
         def _current_avg() -> float:
             return float(total_quote / total_base) if total_base > 0 else 0.0
@@ -770,6 +933,104 @@ class PendingOrderWorker:
                         price=limit_price,
                         client_order_id=limit_client_oid,
                     )
+                elif isinstance(client, BybitClient):
+                    res1 = client.place_limit_order(
+                        symbol=str(symbol),
+                        side=side,
+                        qty=remaining,
+                        price=limit_price,
+                        reduce_only=reduce_only,
+                        client_order_id=limit_client_oid,
+                    )
+                elif isinstance(client, CoinbaseExchangeClient):
+                    res1 = client.place_limit_order(
+                        symbol=str(symbol),
+                        side=side,
+                        size=remaining,
+                        price=limit_price,
+                        client_order_id=limit_client_oid,
+                    )
+                elif isinstance(client, KrakenClient):
+                    # Kraken is spot-only and returns txid as order id.
+                    res1 = client.place_limit_order(
+                        symbol=str(symbol),
+                        side=side,
+                        size=remaining,
+                        price=limit_price,
+                        client_order_id=limit_client_oid,
+                    )
+                elif isinstance(client, KrakenFuturesClient):
+                    # Kraken Futures expects instrument symbols; size is treated as contracts in this client.
+                    res1 = client.place_limit_order(
+                        symbol=str(symbol),
+                        side=side,
+                        size=remaining,
+                        price=limit_price,
+                        reduce_only=reduce_only,
+                        post_only=(order_mode in ("maker", "maker_then_market", "limit_first", "limit")),
+                        client_order_id=limit_client_oid,
+                    )
+                elif isinstance(client, KucoinSpotClient):
+                    res1 = client.place_limit_order(
+                        symbol=str(symbol),
+                        side=side,
+                        size=remaining,
+                        price=limit_price,
+                        client_order_id=limit_client_oid,
+                    )
+                elif isinstance(client, KucoinFuturesClient):
+                    try:
+                        if market_type == "swap":
+                            client.set_leverage(symbol=str(symbol), leverage=leverage)
+                    except Exception:
+                        pass
+                    res1 = client.place_limit_order(
+                        symbol=str(symbol),
+                        side=side,
+                        size=remaining,
+                        price=limit_price,
+                        reduce_only=reduce_only,
+                        post_only=(order_mode in ("maker", "maker_then_market", "limit_first", "limit")),
+                        client_order_id=limit_client_oid,
+                    )
+                elif isinstance(client, GateSpotClient):
+                    res1 = client.place_limit_order(
+                        symbol=str(symbol),
+                        side=side,
+                        size=remaining,
+                        price=limit_price,
+                        client_order_id=limit_client_oid,
+                    )
+                elif isinstance(client, GateUsdtFuturesClient):
+                    # Best-effort set leverage before futures order
+                    try:
+                        client.set_leverage(contract=to_gate_currency_pair(str(symbol)), leverage=leverage)
+                    except Exception:
+                        pass
+                    res1 = client.place_limit_order(
+                        symbol=str(symbol),
+                        side=side,
+                        size=remaining,
+                        price=limit_price,
+                        reduce_only=reduce_only,
+                        client_order_id=limit_client_oid,
+                    )
+                elif isinstance(client, BitfinexClient):
+                    res1 = client.place_limit_order(
+                        symbol=str(symbol),
+                        side=side,
+                        size=remaining,
+                        price=limit_price,
+                        client_order_id=limit_client_oid,
+                    )
+                elif isinstance(client, BitfinexDerivativesClient):
+                    res1 = client.place_limit_order(
+                        symbol=str(symbol),
+                        side=side,
+                        size=remaining,
+                        price=limit_price,
+                        client_order_id=limit_client_oid,
+                    )
                 else:
                     raise LiveTradingError(f"Unsupported client type: {type(client)}")
 
@@ -781,10 +1042,14 @@ class PendingOrderWorker:
                     q = client.wait_for_fill(symbol=str(symbol), order_id=limit_order_id, client_order_id=limit_client_oid, max_wait_sec=maker_wait_sec)
                     phases["limit_query"] = q
                     _apply_fill(float(q.get("filled") or 0.0), float(q.get("avg_price") or 0.0))
+                    fee_v, fee_c = _fetch_fee_best_effort(order_id0=limit_order_id, client_order_id0=limit_client_oid)
+                    _apply_fee(float(fee_v or 0.0), str(fee_c or ""))
                 elif isinstance(client, BinanceSpotClient):
                     q = client.wait_for_fill(symbol=str(symbol), order_id=limit_order_id, client_order_id=limit_client_oid, max_wait_sec=maker_wait_sec)
                     phases["limit_query"] = q
                     _apply_fill(float(q.get("filled") or 0.0), float(q.get("avg_price") or 0.0))
+                    fee_v, fee_c = _fetch_fee_best_effort(order_id0=limit_order_id, client_order_id0=limit_client_oid)
+                    _apply_fee(float(fee_v or 0.0), str(fee_c or ""))
                 elif isinstance(client, OkxClient):
                     q = client.wait_for_fill(symbol=str(symbol), ord_id=limit_order_id, cl_ord_id=limit_client_oid, market_type=market_type, max_wait_sec=maker_wait_sec)
                     phases["limit_query"] = q
@@ -798,6 +1063,48 @@ class PendingOrderWorker:
                     _apply_fee(float(q.get("fee") or 0.0), str(q.get("fee_ccy") or ""))
                 elif isinstance(client, BitgetSpotClient):
                     q = client.wait_for_fill(symbol=str(symbol), order_id=limit_order_id, client_order_id=limit_client_oid, max_wait_sec=maker_wait_sec)
+                    phases["limit_query"] = q
+                    _apply_fill(float(q.get("filled") or 0.0), float(q.get("avg_price") or 0.0))
+                    _apply_fee(float(q.get("fee") or 0.0), str(q.get("fee_ccy") or ""))
+                elif isinstance(client, BybitClient):
+                    q = client.wait_for_fill(symbol=str(symbol), order_id=limit_order_id, client_order_id=limit_client_oid, max_wait_sec=maker_wait_sec)
+                    phases["limit_query"] = q
+                    _apply_fill(float(q.get("filled") or 0.0), float(q.get("avg_price") or 0.0))
+                elif isinstance(client, CoinbaseExchangeClient):
+                    q = client.wait_for_fill(order_id=limit_order_id, client_order_id=limit_client_oid, max_wait_sec=maker_wait_sec)
+                    phases["limit_query"] = q
+                    _apply_fill(float(q.get("filled") or 0.0), float(q.get("avg_price") or 0.0))
+                elif isinstance(client, KrakenClient):
+                    q = client.wait_for_fill(order_id=limit_order_id, max_wait_sec=maker_wait_sec)
+                    phases["limit_query"] = q
+                    _apply_fill(float(q.get("filled") or 0.0), float(q.get("avg_price") or 0.0))
+                elif isinstance(client, KrakenFuturesClient):
+                    q = client.wait_for_fill(order_id=limit_order_id, client_order_id=limit_client_oid, max_wait_sec=maker_wait_sec)
+                    phases["limit_query"] = q
+                    _apply_fill(float(q.get("filled") or 0.0), float(q.get("avg_price") or 0.0))
+                elif isinstance(client, KucoinSpotClient):
+                    q = client.wait_for_fill(order_id=limit_order_id, max_wait_sec=maker_wait_sec)
+                    phases["limit_query"] = q
+                    _apply_fill(float(q.get("filled") or 0.0), float(q.get("avg_price") or 0.0))
+                    _apply_fee(float(q.get("fee") or 0.0), str(q.get("fee_ccy") or ""))
+                elif isinstance(client, KucoinFuturesClient):
+                    q = client.wait_for_fill(order_id=limit_order_id, max_wait_sec=maker_wait_sec)
+                    phases["limit_query"] = q
+                    _apply_fill(float(q.get("filled") or 0.0), float(q.get("avg_price") or 0.0))
+                elif isinstance(client, GateSpotClient):
+                    q = client.wait_for_fill(order_id=limit_order_id, max_wait_sec=maker_wait_sec)
+                    phases["limit_query"] = q
+                    _apply_fill(float(q.get("filled") or 0.0), float(q.get("avg_price") or 0.0))
+                elif isinstance(client, GateUsdtFuturesClient):
+                    q = client.wait_for_fill(order_id=limit_order_id, contract=to_gate_currency_pair(str(symbol)), max_wait_sec=maker_wait_sec)
+                    phases["limit_query"] = q
+                    _apply_fill(float(q.get("filled") or 0.0), float(q.get("avg_price") or 0.0))
+                elif isinstance(client, BitfinexClient):
+                    q = client.wait_for_fill(order_id=limit_order_id, max_wait_sec=maker_wait_sec)
+                    phases["limit_query"] = q
+                    _apply_fill(float(q.get("filled") or 0.0), float(q.get("avg_price") or 0.0))
+                elif isinstance(client, BitfinexDerivativesClient):
+                    q = client.wait_for_fill(order_id=limit_order_id, max_wait_sec=maker_wait_sec)
                     phases["limit_query"] = q
                     _apply_fill(float(q.get("filled") or 0.0), float(q.get("avg_price") or 0.0))
 
@@ -842,6 +1149,26 @@ class PendingOrderWorker:
                             phases["limit_cancel"] = client.cancel_order(symbol=str(symbol), product_type=product_type, margin_coin=margin_coin, order_id=limit_order_id, client_oid=limit_client_oid)
                         elif isinstance(client, BitgetSpotClient):
                             phases["limit_cancel"] = client.cancel_order(symbol=str(symbol), client_order_id=limit_client_oid)
+                        elif isinstance(client, BybitClient):
+                            phases["limit_cancel"] = client.cancel_order(symbol=str(symbol), order_id=limit_order_id, client_order_id=limit_client_oid)
+                        elif isinstance(client, CoinbaseExchangeClient):
+                            phases["limit_cancel"] = client.cancel_order(order_id=limit_order_id, client_order_id=limit_client_oid)
+                        elif isinstance(client, KrakenClient):
+                            phases["limit_cancel"] = client.cancel_order(order_id=limit_order_id)
+                        elif isinstance(client, KrakenFuturesClient):
+                            phases["limit_cancel"] = client.cancel_order(order_id=limit_order_id, client_order_id=limit_client_oid)
+                        elif isinstance(client, KucoinSpotClient):
+                            phases["limit_cancel"] = client.cancel_order(order_id=limit_order_id, client_order_id=limit_client_oid)
+                        elif isinstance(client, KucoinFuturesClient):
+                            phases["limit_cancel"] = client.cancel_order(order_id=limit_order_id, client_order_id=limit_client_oid)
+                        elif isinstance(client, GateSpotClient):
+                            phases["limit_cancel"] = client.cancel_order(order_id=limit_order_id)
+                        elif isinstance(client, GateUsdtFuturesClient):
+                            phases["limit_cancel"] = client.cancel_order(order_id=limit_order_id)
+                        elif isinstance(client, BitfinexClient):
+                            phases["limit_cancel"] = client.cancel_order(order_id=limit_order_id, client_order_id=limit_client_oid)
+                        elif isinstance(client, BitfinexDerivativesClient):
+                            phases["limit_cancel"] = client.cancel_order(order_id=limit_order_id, client_order_id=limit_client_oid)
                     except Exception:
                         pass
             except LiveTradingError as e:
@@ -930,6 +1257,95 @@ class PendingOrderWorker:
                         size=mkt_size,
                         client_order_id=market_client_oid,
                     )
+                elif isinstance(client, BybitClient):
+                    res2 = client.place_market_order(
+                        symbol=str(symbol),
+                        side=side,
+                        qty=remaining,
+                        reduce_only=reduce_only,
+                        client_order_id=market_client_oid,
+                    )
+                elif isinstance(client, CoinbaseExchangeClient):
+                    res2 = client.place_market_order(
+                        symbol=str(symbol),
+                        side=side,
+                        size=remaining,
+                        client_order_id=market_client_oid,
+                    )
+                elif isinstance(client, KrakenClient):
+                    res2 = client.place_market_order(
+                        symbol=str(symbol),
+                        side=side,
+                        size=remaining,
+                        client_order_id=market_client_oid,
+                    )
+                elif isinstance(client, KrakenFuturesClient):
+                    res2 = client.place_market_order(
+                        symbol=str(symbol),
+                        side=side,
+                        size=remaining,
+                        reduce_only=reduce_only,
+                        client_order_id=market_client_oid,
+                    )
+                elif isinstance(client, KucoinSpotClient):
+                    # KuCoin market BUY expects quote funds; convert base->quote using ref_price.
+                    if side == "buy" and ref_price > 0:
+                        res2 = client.place_market_order(
+                            symbol=str(symbol),
+                            side=side,
+                            size=float(remaining) * float(ref_price),
+                            quote_size=True,
+                            client_order_id=market_client_oid,
+                        )
+                    else:
+                        res2 = client.place_market_order(
+                            symbol=str(symbol),
+                            side=side,
+                            size=remaining,
+                            quote_size=False,
+                            client_order_id=market_client_oid,
+                        )
+                elif isinstance(client, KucoinFuturesClient):
+                    try:
+                        if market_type == "swap":
+                            client.set_leverage(symbol=str(symbol), leverage=leverage)
+                    except Exception:
+                        pass
+                    res2 = client.place_market_order(
+                        symbol=str(symbol),
+                        side=side,
+                        size=remaining,
+                        reduce_only=reduce_only,
+                        client_order_id=market_client_oid,
+                    )
+                elif isinstance(client, GateSpotClient):
+                    res2 = client.place_market_order(
+                        symbol=str(symbol),
+                        side=side,
+                        size=remaining,
+                        client_order_id=market_client_oid,
+                    )
+                elif isinstance(client, GateUsdtFuturesClient):
+                    try:
+                        client.set_leverage(contract=to_gate_currency_pair(str(symbol)), leverage=leverage)
+                    except Exception:
+                        pass
+                    res2 = client.place_market_order(
+                        symbol=str(symbol),
+                        side=side,
+                        size=remaining,
+                        reduce_only=reduce_only,
+                        client_order_id=market_client_oid,
+                    )
+                elif isinstance(client, BitfinexClient):
+                    res2 = client.place_market_order(
+                        symbol=str(symbol),
+                        side=side,
+                        size=remaining,
+                        client_order_id=market_client_oid,
+                    )
+                elif isinstance(client, BitfinexDerivativesClient):
+                    res2 = client.place_market_order(symbol=str(symbol), side=side, size=remaining, client_order_id=market_client_oid)
                 else:
                     raise LiveTradingError(f"Unsupported client type: {type(client)}")
 
@@ -941,10 +1357,14 @@ class PendingOrderWorker:
                     q2 = client.wait_for_fill(symbol=str(symbol), order_id=market_order_id, client_order_id=market_client_oid, max_wait_sec=3.0)
                     phases["market_query"] = q2
                     _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
+                    fee_v, fee_c = _fetch_fee_best_effort(order_id0=market_order_id, client_order_id0=market_client_oid)
+                    _apply_fee(float(fee_v or 0.0), str(fee_c or ""))
                 elif isinstance(client, BinanceSpotClient):
                     q2 = client.wait_for_fill(symbol=str(symbol), order_id=market_order_id, client_order_id=market_client_oid, max_wait_sec=3.0)
                     phases["market_query"] = q2
                     _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
+                    fee_v, fee_c = _fetch_fee_best_effort(order_id0=market_order_id, client_order_id0=market_client_oid)
+                    _apply_fee(float(fee_v or 0.0), str(fee_c or ""))
                 elif isinstance(client, OkxClient):
                     # OKX fills endpoint may lag shortly after execution; wait a bit longer to capture fee.
                     q2 = client.wait_for_fill(symbol=str(symbol), ord_id=market_order_id, cl_ord_id=market_client_oid, market_type=market_type, max_wait_sec=12.0)
@@ -959,6 +1379,48 @@ class PendingOrderWorker:
                     _apply_fee(float(q2.get("fee") or 0.0), str(q2.get("fee_ccy") or ""))
                 elif isinstance(client, BitgetSpotClient):
                     q2 = client.wait_for_fill(symbol=str(symbol), order_id=market_order_id, client_order_id=market_client_oid, max_wait_sec=3.0)
+                    phases["market_query"] = q2
+                    _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
+                    _apply_fee(float(q2.get("fee") or 0.0), str(q2.get("fee_ccy") or ""))
+                elif isinstance(client, BybitClient):
+                    q2 = client.wait_for_fill(symbol=str(symbol), order_id=market_order_id, client_order_id=market_client_oid, max_wait_sec=3.0)
+                    phases["market_query"] = q2
+                    _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
+                elif isinstance(client, CoinbaseExchangeClient):
+                    q2 = client.wait_for_fill(order_id=market_order_id, client_order_id=market_client_oid, max_wait_sec=3.0)
+                    phases["market_query"] = q2
+                    _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
+                elif isinstance(client, KrakenClient):
+                    q2 = client.wait_for_fill(order_id=market_order_id, max_wait_sec=3.0)
+                    phases["market_query"] = q2
+                    _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
+                elif isinstance(client, KrakenFuturesClient):
+                    q2 = client.wait_for_fill(order_id=market_order_id, client_order_id=market_client_oid, max_wait_sec=3.0)
+                    phases["market_query"] = q2
+                    _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
+                elif isinstance(client, KucoinSpotClient):
+                    q2 = client.wait_for_fill(order_id=market_order_id, max_wait_sec=3.0)
+                    phases["market_query"] = q2
+                    _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
+                    _apply_fee(float(q2.get("fee") or 0.0), str(q2.get("fee_ccy") or ""))
+                elif isinstance(client, KucoinFuturesClient):
+                    q2 = client.wait_for_fill(order_id=market_order_id, max_wait_sec=3.0)
+                    phases["market_query"] = q2
+                    _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
+                elif isinstance(client, GateSpotClient):
+                    q2 = client.wait_for_fill(order_id=market_order_id, max_wait_sec=3.0)
+                    phases["market_query"] = q2
+                    _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
+                elif isinstance(client, GateUsdtFuturesClient):
+                    q2 = client.wait_for_fill(order_id=market_order_id, contract=to_gate_currency_pair(str(symbol)), max_wait_sec=3.0)
+                    phases["market_query"] = q2
+                    _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
+                elif isinstance(client, BitfinexClient):
+                    q2 = client.wait_for_fill(order_id=market_order_id, max_wait_sec=3.0)
+                    phases["market_query"] = q2
+                    _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
+                elif isinstance(client, BitfinexDerivativesClient):
+                    q2 = client.wait_for_fill(order_id=market_order_id, max_wait_sec=3.0)
                     phases["market_query"] = q2
                     _apply_fill(float(q2.get("filled") or 0.0), float(q2.get("avg_price") or 0.0))
             except LiveTradingError as e:
@@ -1015,6 +1477,10 @@ class PendingOrderWorker:
         # Record trade + update local position snapshot (best-effort).
         try:
             if filled > 0 and avg_price > 0:
+                logger.info(
+                    f"live record begin: pending_id={order_id} strategy_id={strategy_id} symbol={symbol} "
+                    f"signal={signal_type} filled={filled} avg_price={avg_price} fee={total_fee} fee_ccy={fee_ccy}"
+                )
                 profit, _pos = apply_fill_to_local_position(
                     strategy_id=strategy_id,
                     symbol=str(symbol),
@@ -1037,6 +1503,7 @@ class PendingOrderWorker:
                     commission_ccy=str(fee_ccy or "").strip().upper(),
                     profit=profit,
                 )
+                logger.info(f"live record done: pending_id={order_id} strategy_id={strategy_id} symbol={symbol} signal={signal_type}")
         except Exception as e:
             logger.warning(f"record_trade/update_position failed: pending_id={order_id}, err={e}")
 

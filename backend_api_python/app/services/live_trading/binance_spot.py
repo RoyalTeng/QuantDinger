@@ -322,6 +322,55 @@ class BinanceSpotClient(BaseRestClient):
         """
         return self._signed_request("GET", "/api/v3/account", params={})
 
+    def get_my_trades(self, *, symbol: str, order_id: str = "", limit: int = 100) -> Any:
+        """
+        Fetch spot trade fills.
+
+        Endpoint: GET /api/v3/myTrades
+        """
+        sym = to_binance_futures_symbol(symbol)
+        if not sym:
+            return []
+        params: Dict[str, Any] = {"symbol": sym}
+        if order_id:
+            params["orderId"] = str(order_id)
+        try:
+            lim = int(limit or 100)
+        except Exception:
+            lim = 100
+        lim = max(1, min(1000, lim))
+        params["limit"] = lim
+        data = self._signed_request("GET", "/api/v3/myTrades", params=params)
+        return data
+
+    def get_fee_for_order(self, *, symbol: str, order_id: str) -> Tuple[float, str]:
+        """
+        Best-effort: sum commissions from fills for a specific spot order.
+
+        Returns: (total_fee, fee_ccy)
+        """
+        try:
+            trades = self.get_my_trades(symbol=symbol, order_id=str(order_id or ""), limit=200)
+        except Exception:
+            trades = []
+        if not isinstance(trades, list):
+            return 0.0, ""
+        total_fee = 0.0
+        fee_ccy = ""
+        for t in trades:
+            if not isinstance(t, dict):
+                continue
+            try:
+                fee = float(t.get("commission") or 0.0)
+            except Exception:
+                fee = 0.0
+            ccy = str(t.get("commissionAsset") or "").strip()
+            if fee != 0.0:
+                total_fee += abs(float(fee))
+                if (not fee_ccy) and ccy:
+                    fee_ccy = ccy
+        return float(total_fee), str(fee_ccy or "")
+
     def cancel_order(self, *, symbol: str, order_id: str = "", client_order_id: str = "") -> Dict[str, Any]:
         sym = to_binance_futures_symbol(symbol)
         params: Dict[str, Any] = {"symbol": sym}

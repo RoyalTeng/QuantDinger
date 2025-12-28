@@ -60,13 +60,174 @@ class StrategyService:
         获取交易所交易对列表 (无需API Key)
         """
         try:
-            import ccxt
-            
             exchange_id = exchange_config.get('exchange_id', '')
             proxies = exchange_config.get('proxies')
             
             if not exchange_id:
                 return {'success': False, 'message': '请选择交易所', 'symbols': []}
+
+            # For these exchanges, prefer direct REST (no ccxt), aligned with local live-trading design.
+            ex = str(exchange_id or "").strip().lower()
+            if ex in ("bybit", "coinbaseexchange", "coinbase_exchange", "kraken", "kucoin", "gate", "bitfinex"):
+                import requests
+
+                def _req_json(url: str) -> Any:
+                    r = requests.get(url, timeout=15, proxies=proxies)
+                    r.raise_for_status()
+                    return r.json()
+
+                symbols: List[str] = []
+                market_type = str(exchange_config.get("market_type") or exchange_config.get("defaultType") or "spot").strip().lower()
+                if market_type in ("futures", "future", "perp", "perpetual"):
+                    market_type = "swap"
+                if ex == "bybit":
+                    base = str(exchange_config.get("base_url") or exchange_config.get("baseUrl") or "https://api.bybit.com").rstrip("/")
+                    cat = "spot" if market_type == "spot" else "linear"
+                    j = _req_json(f"{base}/v5/market/instruments-info?category={cat}")
+                    lst = (((j.get("result") or {}).get("list")) if isinstance(j, dict) else None) or []
+                    if isinstance(lst, list):
+                        for it in lst:
+                            if not isinstance(it, dict):
+                                continue
+                            sym = str(it.get("symbol") or "")
+                            status = str(it.get("status") or "").lower()
+                            if not sym or (status and status not in ("trading", "tradable", "online")):
+                                continue
+                            if sym.endswith("USDT") and len(sym) > 4:
+                                symbols.append(f"{sym[:-4]}/USDT")
+                    symbols = sorted(list(set(symbols)))
+                    return {'success': True, 'message': f'获取成功，共 {len(symbols)} 个交易对', 'symbols': symbols}
+
+                if ex in ("coinbaseexchange", "coinbase_exchange"):
+                    base = str(exchange_config.get("base_url") or exchange_config.get("baseUrl") or "https://api.exchange.coinbase.com").rstrip("/")
+                    j = _req_json(f"{base}/products")
+                    if isinstance(j, list):
+                        for it in j:
+                            if not isinstance(it, dict):
+                                continue
+                            if str(it.get("status") or "").lower() not in ("online", ""):
+                                continue
+                            base_ccy = str(it.get("base_currency") or "").upper()
+                            quote_ccy = str(it.get("quote_currency") or "").upper()
+                            if quote_ccy == "USDT" and base_ccy:
+                                symbols.append(f"{base_ccy}/USDT")
+                    symbols = sorted(list(set(symbols)))
+                    return {'success': True, 'message': f'获取成功，共 {len(symbols)} 个交易对', 'symbols': symbols}
+
+                if ex == "kraken":
+                    if market_type == "spot":
+                        j = _req_json("https://api.kraken.com/0/public/AssetPairs")
+                        res = (j.get("result") if isinstance(j, dict) else None) or {}
+                        if isinstance(res, dict):
+                            for _k, v in res.items():
+                                if not isinstance(v, dict):
+                                    continue
+                                wsname = str(v.get("wsname") or "")
+                                if not wsname or "/" not in wsname:
+                                    continue
+                                base_ccy, quote_ccy = wsname.split("/", 1)
+                                if str(quote_ccy).upper() == "USDT":
+                                    symbols.append(f"{str(base_ccy).upper()}/USDT")
+                    else:
+                        base = str(exchange_config.get("futures_base_url") or exchange_config.get("futuresBaseUrl") or "https://futures.kraken.com").rstrip("/")
+                        j = _req_json(f"{base}/derivatives/api/v3/instruments")
+                        instruments = j.get("instruments") if isinstance(j, dict) else None
+                        if isinstance(instruments, list):
+                            for it in instruments:
+                                if not isinstance(it, dict):
+                                    continue
+                                sym = str(it.get("symbol") or "")
+                                typ = str(it.get("type") or "").lower()
+                                if sym and ("perpetual" in typ or typ.startswith("pf") or sym.startswith("PF_")):
+                                    symbols.append(sym)
+                    symbols = sorted(list(set(symbols)))
+                    return {'success': True, 'message': f'获取成功，共 {len(symbols)} 个交易对', 'symbols': symbols}
+
+                if ex == "kucoin":
+                    if market_type == "spot":
+                        base = str(exchange_config.get("base_url") or exchange_config.get("baseUrl") or "https://api.kucoin.com").rstrip("/")
+                        j = _req_json(f"{base}/api/v1/symbols")
+                        data = (j.get("data") if isinstance(j, dict) else None) or []
+                        if isinstance(data, list):
+                            for it in data:
+                                if not isinstance(it, dict):
+                                    continue
+                                if not bool(it.get("enableTrading", True)):
+                                    continue
+                                if str(it.get("quoteCurrency") or "").upper() != "USDT":
+                                    continue
+                                b = str(it.get("baseCurrency") or "").upper()
+                                if b:
+                                    symbols.append(f"{b}/USDT")
+                    else:
+                        base = str(exchange_config.get("futures_base_url") or exchange_config.get("futuresBaseUrl") or "https://api-futures.kucoin.com").rstrip("/")
+                        j = _req_json(f"{base}/api/v1/contracts/active")
+                        data = (j.get("data") if isinstance(j, dict) else None) or []
+                        if isinstance(data, list):
+                            for it in data:
+                                if not isinstance(it, dict):
+                                    continue
+                                sym = str(it.get("symbol") or "")
+                                if not sym or not sym.upper().endswith("USDTM"):
+                                    continue
+                                base_ccy = sym[:-5].upper()
+                                if base_ccy == "XBT":
+                                    base_ccy = "BTC"
+                                if base_ccy:
+                                    symbols.append(f"{base_ccy}/USDT")
+                    symbols = sorted(list(set(symbols)))
+                    return {'success': True, 'message': f'获取成功，共 {len(symbols)} 个交易对', 'symbols': symbols}
+
+                if ex == "gate":
+                    base = str(exchange_config.get("base_url") or exchange_config.get("baseUrl") or "https://api.gateio.ws").rstrip("/")
+                    if market_type == "spot":
+                        j = _req_json(f"{base}/api/v4/spot/currency_pairs")
+                        if isinstance(j, list):
+                            for it in j:
+                                if not isinstance(it, dict):
+                                    continue
+                                if str(it.get("trade_status") or "").lower() not in ("tradable", "trading", ""):
+                                    continue
+                                base_ccy = str(it.get("base") or "").upper()
+                                quote_ccy = str(it.get("quote") or "").upper()
+                                if quote_ccy == "USDT" and base_ccy:
+                                    symbols.append(f"{base_ccy}/USDT")
+                    else:
+                        j = _req_json(f"{base}/api/v4/futures/usdt/contracts")
+                        if isinstance(j, list):
+                            for it in j:
+                                if not isinstance(it, dict):
+                                    continue
+                                name = str(it.get("name") or it.get("contract") or "")
+                                if name and name.upper().endswith("_USDT"):
+                                    symbols.append(name.replace("_", "/"))
+                    symbols = sorted(list(set(symbols)))
+                    return {'success': True, 'message': f'获取成功，共 {len(symbols)} 个交易对', 'symbols': symbols}
+
+                if ex == "bitfinex":
+                    j = _req_json("https://api-pub.bitfinex.com/v2/conf/pub:list:pair:exchange") if market_type == "spot" else _req_json(
+                        "https://api-pub.bitfinex.com/v2/conf/pub:list:pair:futures"
+                    )
+                    pairs = []
+                    if isinstance(j, list) and j and isinstance(j[0], list):
+                        pairs = j[0]
+                    for p in pairs:
+                        s = str(p or "").upper()
+                        if not s:
+                            continue
+                        if market_type != "spot":
+                            symbols.append(s)
+                            continue
+                        # Focus USDT (Bitfinex uses UST)
+                        if s.endswith("UST") and len(s) > 3:
+                            symbols.append(f"{s[:-3]}/USDT")
+                        elif s.endswith("USDT") and len(s) > 4:
+                            symbols.append(f"{s[:-4]}/USDT")
+                    symbols = sorted(list(set(symbols)))
+                    return {'success': True, 'message': f'获取成功，共 {len(symbols)} 个交易对', 'symbols': symbols}
+                return {'success': True, 'message': '获取成功', 'symbols': symbols}
+            
+            import ccxt
             
             # 创建交易所实例 (public only)
             exchange_class = getattr(ccxt, exchange_id, None)
@@ -112,6 +273,14 @@ class StrategyService:
                 from app.services.live_trading.binance_spot import BinanceSpotClient
                 from app.services.live_trading.okx import OkxClient
                 from app.services.live_trading.bitget import BitgetMixClient
+                from app.services.live_trading.bybit import BybitClient
+                from app.services.live_trading.coinbase_exchange import CoinbaseExchangeClient
+                from app.services.live_trading.kraken import KrakenClient
+                from app.services.live_trading.kraken_futures import KrakenFuturesClient
+                from app.services.live_trading.kucoin import KucoinSpotClient
+                from app.services.live_trading.kucoin import KucoinFuturesClient
+                from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient
+                from app.services.live_trading.bitfinex import BitfinexClient, BitfinexDerivativesClient
 
                 resolved = resolve_exchange_config(exchange_config or {})
                 safe_cfg = safe_exchange_config_for_log(resolved)
@@ -160,6 +329,26 @@ class StrategyService:
                     elif isinstance(client, BitgetMixClient):
                         product_type = str(resolved.get("product_type") or resolved.get("productType") or "USDT-FUTURES")
                         priv_data = client.get_accounts(product_type=product_type)
+                    elif isinstance(client, BybitClient):
+                        priv_data = client.get_wallet_balance()
+                    elif isinstance(client, CoinbaseExchangeClient):
+                        priv_data = client.get_accounts()
+                    elif isinstance(client, KrakenClient):
+                        priv_data = client.get_balance()
+                    elif isinstance(client, KrakenFuturesClient):
+                        priv_data = client.get_accounts()
+                    elif isinstance(client, KucoinSpotClient):
+                        priv_data = client.get_accounts()
+                    elif isinstance(client, KucoinFuturesClient):
+                        priv_data = client.get_accounts()
+                    elif isinstance(client, GateSpotClient):
+                        priv_data = client.get_accounts()
+                    elif isinstance(client, GateUsdtFuturesClient):
+                        priv_data = client.get_accounts()
+                    elif isinstance(client, BitfinexClient):
+                        priv_data = client.get_wallets()
+                    elif isinstance(client, BitfinexDerivativesClient):
+                        priv_data = client.get_wallets()
                 except Exception as e:
                     msg = str(e)
                     # Add actionable hints for the most common Binance auth error.

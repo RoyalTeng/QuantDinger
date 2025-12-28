@@ -116,7 +116,7 @@ def get_trades():
             cur = db.cursor()
             cur.execute(
                 """
-                SELECT id, strategy_id, symbol, type, price, amount, value, commission, profit, created_at
+                SELECT id, strategy_id, symbol, type, price, amount, value, commission, commission_ccy, profit, created_at
                 FROM qd_strategy_trades
                 WHERE strategy_id = ?
                 ORDER BY id DESC

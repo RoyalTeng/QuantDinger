@@ -316,6 +316,8 @@ class BitgetSpotClient(BaseRestClient):
                 fills = data if isinstance(data, list) else []
                 total_base = 0.0
                 total_quote = 0.0
+                total_fee = 0.0
+                fee_ccy = ""
                 if isinstance(fills, list):
                     for f in fills:
                         try:
@@ -324,10 +326,33 @@ class BitgetSpotClient(BaseRestClient):
                             if sz > 0 and px > 0:
                                 total_base += sz
                                 total_quote += sz * px
+                            # Best-effort fee extraction (fields vary by endpoint/version).
+                            fee_v = f.get("fee")
+                            if fee_v is None:
+                                fee_v = f.get("fillFee")
+                            if fee_v is None:
+                                fee_v = f.get("tradeFee")
+                            try:
+                                fee = float(fee_v or 0.0)
+                            except Exception:
+                                fee = 0.0
+                            ccy = str(f.get("feeCoin") or f.get("feeCcy") or f.get("fillFeeCoin") or f.get("fillFeeCcy") or "").strip()
+                            if fee != 0.0:
+                                total_fee += abs(float(fee))
+                                if (not fee_ccy) and ccy:
+                                    fee_ccy = ccy
                         except Exception:
                             continue
                 if total_base > 0 and total_quote > 0:
-                    return {"filled": total_base, "avg_price": total_quote / total_base, "state": state, "order": last_order, "fills": last_fills}
+                    return {
+                        "filled": total_base,
+                        "avg_price": total_quote / total_base,
+                        "fee": float(total_fee),
+                        "fee_ccy": str(fee_ccy or ""),
+                        "state": state,
+                        "order": last_order,
+                        "fills": last_fills
+                    }
             except Exception:
                 pass
 

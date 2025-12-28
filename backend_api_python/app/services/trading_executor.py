@@ -1889,7 +1889,9 @@ class TradingExecutor:
                  if market_type == 'spot':
                      amount = available_capital * position_ratio / current_price
                  else:
-                     amount = (initial_capital * position_ratio * leverage) / current_price
+                     # Futures sizing: treat available_capital as margin budget.
+                     # Notional = margin * leverage, so base quantity = (margin * leverage) / price.
+                     amount = (available_capital * position_ratio * leverage) / current_price
 
             # Reduce sizing: position_size is treated as a reduce ratio (close X% of current position).
             if sig in ("reduce_long", "reduce_short"):

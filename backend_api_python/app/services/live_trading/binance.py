@@ -254,6 +254,82 @@ class BinanceFuturesClient(BaseRestClient):
         """
         return self._signed_request("GET", "/fapi/v2/account", params={})
 
+    def get_user_trades(self, *, symbol: str, order_id: str = "", limit: int = 100) -> Any:
+        """
+        Fetch user trades (fills).
+
+        Endpoint: GET /fapi/v1/userTrades
+
+        Note: Binance order endpoints do NOT include commissions; commissions live on fills.
+        """
+        sym = to_binance_futures_symbol(symbol)
+        if not sym:
+            return []
+        params: Dict[str, Any] = {"symbol": sym}
+        if order_id:
+            # Binance expects numeric orderId; keep as string and let server validate.
+            params["orderId"] = str(order_id)
+        try:
+            lim = int(limit or 100)
+        except Exception:
+            lim = 100
+        lim = max(1, min(1000, lim))
+        params["limit"] = lim
+        data = self._signed_request("GET", "/fapi/v1/userTrades", params=params)
+        return data
+
+    def get_fee_for_order(self, *, symbol: str, order_id: str) -> Tuple[float, str]:
+        """
+        Best-effort: sum commissions from fills for a specific order.
+
+        Returns: (total_fee, fee_ccy)
+        """
+        try:
+            trades = self.get_user_trades(symbol=symbol, order_id=str(order_id or ""), limit=200)
+        except Exception:
+            trades = []
+        if not isinstance(trades, list):
+            return 0.0, ""
+        total_fee = 0.0
+        fee_ccy = ""
+        for t in trades:
+            if not isinstance(t, dict):
+                continue
+            try:
+                fee = float(t.get("commission") or 0.0)
+            except Exception:
+                fee = 0.0
+            ccy = str(t.get("commissionAsset") or "").strip()
+            if fee != 0.0:
+                total_fee += abs(float(fee))
+                if (not fee_ccy) and ccy:
+                    fee_ccy = ccy
+        return float(total_fee), str(fee_ccy or "")
+
+    def set_leverage(self, *, symbol: str, leverage: float) -> Dict[str, Any]:
+        """
+        Set futures leverage for a symbol (USDT-M).
+
+        Endpoint: POST /fapi/v1/leverage
+
+        Notes:
+        - Binance applies leverage per symbol.
+        - If leverage is not set, the exchange may keep a default (often 1x),
+          which will change the actual margin used for a given notional.
+        """
+        sym = to_binance_futures_symbol(symbol)
+        if not sym:
+            raise LiveTradingError(f"Invalid symbol: {symbol}")
+        try:
+            lev = int(float(leverage or 1.0))
+        except Exception:
+            lev = 1
+        if lev < 1:
+            lev = 1
+        if lev > 125:
+            lev = 125
+        return self._signed_request("POST", "/fapi/v1/leverage", params={"symbol": sym, "leverage": lev})
+
     def get_dual_side_position(self) -> Optional[bool]:
         """
         Best-effort read of position mode:

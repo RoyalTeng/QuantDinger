@@ -12,6 +12,14 @@ from app.services.live_trading.binance_spot import BinanceSpotClient
 from app.services.live_trading.okx import OkxClient
 from app.services.live_trading.bitget import BitgetMixClient
 from app.services.live_trading.bitget_spot import BitgetSpotClient
+from app.services.live_trading.bybit import BybitClient
+from app.services.live_trading.coinbase_exchange import CoinbaseExchangeClient
+from app.services.live_trading.kraken import KrakenClient
+from app.services.live_trading.kraken_futures import KrakenFuturesClient
+from app.services.live_trading.kucoin import KucoinSpotClient
+from app.services.live_trading.kucoin import KucoinFuturesClient
+from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient
+from app.services.live_trading.bitfinex import BitfinexClient, BitfinexDerivativesClient
 
 
 def _signal_to_sides(signal_type: str) -> Tuple[str, str, bool]:
@@ -108,6 +116,33 @@ def place_order_from_signal(
             size=qty,
             client_order_id=client_order_id,
         )
+    if isinstance(client, BybitClient):
+        return client.place_market_order(
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            reduce_only=reduce_only,
+            client_order_id=client_order_id,
+        )
+    if isinstance(client, CoinbaseExchangeClient):
+        return client.place_market_order(symbol=symbol, side=side, size=qty, client_order_id=client_order_id)
+    if isinstance(client, KrakenClient):
+        return client.place_market_order(symbol=symbol, side=side, size=qty, client_order_id=client_order_id)
+    if isinstance(client, KucoinSpotClient):
+        # KuCoin market BUY often requires quote funds; this simplified path does not convert.
+        return client.place_market_order(symbol=symbol, side=side, size=qty, client_order_id=client_order_id, quote_size=False)
+    if isinstance(client, KucoinFuturesClient):
+        return client.place_market_order(symbol=symbol, side=side, size=qty, reduce_only=reduce_only, client_order_id=client_order_id)
+    if isinstance(client, GateSpotClient):
+        return client.place_market_order(symbol=symbol, side=side, size=qty, client_order_id=client_order_id)
+    if isinstance(client, GateUsdtFuturesClient):
+        return client.place_market_order(symbol=symbol, side=side, size=qty, reduce_only=reduce_only, client_order_id=client_order_id)
+    if isinstance(client, BitfinexClient):
+        return client.place_market_order(symbol=symbol, side=side, size=qty, client_order_id=client_order_id)
+    if isinstance(client, BitfinexDerivativesClient):
+        return client.place_market_order(symbol=symbol, side=side, size=qty, client_order_id=client_order_id)
+    if isinstance(client, KrakenFuturesClient):
+        return client.place_market_order(symbol=symbol, side=side, size=qty, reduce_only=reduce_only, client_order_id=client_order_id)
 
     raise LiveTradingError(f"Unsupported client type: {type(client)}")
 

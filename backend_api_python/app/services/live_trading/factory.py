@@ -12,6 +12,13 @@ from app.services.live_trading.binance_spot import BinanceSpotClient
 from app.services.live_trading.okx import OkxClient
 from app.services.live_trading.bitget import BitgetMixClient
 from app.services.live_trading.bitget_spot import BitgetSpotClient
+from app.services.live_trading.bybit import BybitClient
+from app.services.live_trading.coinbase_exchange import CoinbaseExchangeClient
+from app.services.live_trading.kraken import KrakenClient
+from app.services.live_trading.kraken_futures import KrakenFuturesClient
+from app.services.live_trading.kucoin import KucoinSpotClient, KucoinFuturesClient
+from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient
+from app.services.live_trading.bitfinex import BitfinexClient, BitfinexDerivativesClient
 
 
 def _get(cfg: Dict[str, Any], *keys: str) -> str:
@@ -53,6 +60,46 @@ def create_client(exchange_config: Dict[str, Any], *, market_type: str = "swap")
             channel_api_code = _get(exchange_config, "channel_api_code", "channelApiCode") or "bntva"
             return BitgetSpotClient(api_key=api_key, secret_key=secret_key, passphrase=passphrase, base_url=base_url, channel_api_code=channel_api_code)
         return BitgetMixClient(api_key=api_key, secret_key=secret_key, passphrase=passphrase, base_url=base_url)
+
+    if exchange_id == "bybit":
+        base_url = _get(exchange_config, "base_url", "baseUrl") or "https://api.bybit.com"
+        category = "spot" if mt == "spot" else "linear"
+        recv_window_ms = int(exchange_config.get("recv_window_ms") or exchange_config.get("recvWindow") or 5000)
+        return BybitClient(api_key=api_key, secret_key=secret_key, base_url=base_url, category=category, recv_window_ms=recv_window_ms)
+
+    if exchange_id in ("coinbaseexchange", "coinbase_exchange"):
+        base_url = _get(exchange_config, "base_url", "baseUrl") or "https://api.exchange.coinbase.com"
+        if mt != "spot":
+            raise LiveTradingError("CoinbaseExchange only supports spot market_type in this project")
+        return CoinbaseExchangeClient(api_key=api_key, secret_key=secret_key, passphrase=passphrase, base_url=base_url)
+
+    if exchange_id == "kraken":
+        base_url = _get(exchange_config, "base_url", "baseUrl") or "https://api.kraken.com"
+        if mt == "spot":
+            return KrakenClient(api_key=api_key, secret_key=secret_key, base_url=base_url)
+        # Futures/perp
+        fut_url = _get(exchange_config, "futures_base_url", "futuresBaseUrl") or "https://futures.kraken.com"
+        return KrakenFuturesClient(api_key=api_key, secret_key=secret_key, base_url=fut_url)
+
+    if exchange_id == "kucoin":
+        base_url = _get(exchange_config, "base_url", "baseUrl") or "https://api.kucoin.com"
+        if mt == "spot":
+            return KucoinSpotClient(api_key=api_key, secret_key=secret_key, passphrase=passphrase, base_url=base_url)
+        fut_url = _get(exchange_config, "futures_base_url", "futuresBaseUrl") or "https://api-futures.kucoin.com"
+        return KucoinFuturesClient(api_key=api_key, secret_key=secret_key, passphrase=passphrase, base_url=fut_url)
+
+    if exchange_id == "gate":
+        base_url = _get(exchange_config, "base_url", "baseUrl") or "https://api.gateio.ws"
+        if mt == "spot":
+            return GateSpotClient(api_key=api_key, secret_key=secret_key, base_url=base_url)
+        # Default to USDT futures for swap
+        return GateUsdtFuturesClient(api_key=api_key, secret_key=secret_key, base_url=base_url)
+
+    if exchange_id == "bitfinex":
+        base_url = _get(exchange_config, "base_url", "baseUrl") or "https://api.bitfinex.com"
+        if mt == "spot":
+            return BitfinexClient(api_key=api_key, secret_key=secret_key, base_url=base_url)
+        return BitfinexDerivativesClient(api_key=api_key, secret_key=secret_key, base_url=base_url)
 
     raise LiveTradingError(f"Unsupported exchange_id: {exchange_id}")
 
